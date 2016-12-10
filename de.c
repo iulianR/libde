@@ -42,6 +42,7 @@ de_frame_new (AVFrame *av_frame, uint8_t *data, int width, int height)
 static void
 de_frame_free (DeFrame *frame)
 {
+    av_frame_free (&frame->frame);
     free (frame->data);
     free (frame);
 }
@@ -59,6 +60,9 @@ de_context_new (void)
 
 void
 de_context_free (DeContext *context) {
+    avcodec_close (context->decoder_ctx);
+    avcodec_close (context->encoder_ctx);
+    avformat_close_input (&context->fmt_ctx);
     free (context);
 }
 
@@ -193,8 +197,6 @@ de_context_decode_frame (DeContext *context,
 
         printf("[LOG] Frame converted\n");
 
-        // de_context_set_next_frame (context, frame);
-
         return frame;
     }
 
@@ -206,6 +208,7 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
     AVPacket pkt;
     AVFrame *rgb_frame = NULL;
     AVFrame *yuv_frame;
+    DeFrame *frame;
     int num_bytes;
     uint8_t *buffer;
 
@@ -227,14 +230,21 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
 
     if (av_read_frame (context->fmt_ctx, &pkt) >= 0) {
         printf("[LOG] Got packet\n");
-        if (pkt.stream_index == context->stream_id)
-            return de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);;
+        if (pkt.stream_index == context->stream_id) {
+            frame = de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);;
+            av_packet_unref (&pkt);
+
+            return frame;
+        }
     } else if (!context->got_last) {
         pkt.data = NULL;
         pkt.size = 0;
         context->got_last = 1;
 
-        return de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);
+        frame = de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);
+        av_packet_unref (&pkt);
+
+        return frame;
     } else {
         *got_frame = -1;
     }
@@ -318,13 +328,12 @@ de_context_set_next_frame (DeContext *context, DeFrame *frame)
 {
     AVPacket pkt;
     int got_output;
+    int linesize[1] = { frame->width };
+    uint8_t *data[1] = { frame->frame->data[0] };
 
     av_init_packet(&pkt);
     pkt.data = NULL;
     pkt.size = 0;
-    int linesize[1] = { frame->width };
-
-    uint8_t *data[1] = { frame->frame->data[0] };
 
     sws_scale(context->encoder_sws_ctx,
               (const uint8_t * const *)data,
@@ -379,4 +388,5 @@ de_context_end_encoding (DeContext *context)
 
     fwrite(endcode, 1, sizeof(endcode), context->outfile);
     fclose (context->outfile);
+    de_context_free (context);
 }

@@ -5,8 +5,8 @@
 typedef struct {
     AVFrame *frame;
     uint8_t *data;
-    int width;
-    int height;
+    int      width;
+    int      height;
 } DeFrame;
 
 typedef struct {
