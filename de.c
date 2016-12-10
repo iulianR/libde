@@ -1,6 +1,5 @@
 #include "de.h"
 
-// #include <libavcodec/bmp.h>
 #include <libavutil/opt.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -143,7 +142,7 @@ de_context_create (const char *infile)
                                       context->decoder_ctx->pix_fmt,
                                       context->decoder_ctx->width,
                                       context->decoder_ctx->height,
-                                      AV_PIX_FMT_RGB24,
+                                      AV_PIX_FMT_RGB8,
                                       SWS_BICUBIC,
                                       NULL,
                                       NULL,
@@ -220,10 +219,10 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
     rgb_frame = av_frame_alloc();
 
     // Determine required buffer size and allocate buffer
-    num_bytes = avpicture_get_size (AV_PIX_FMT_RGB24, context->decoder_ctx->width, context->decoder_ctx->height);
+    num_bytes = avpicture_get_size (AV_PIX_FMT_RGB8, context->decoder_ctx->width, context->decoder_ctx->height);
     buffer = (uint8_t *)av_malloc (num_bytes * sizeof(uint8_t));
 
-    avpicture_fill((AVPicture *)rgb_frame, buffer, AV_PIX_FMT_RGB24,
+    avpicture_fill((AVPicture *)rgb_frame, buffer, AV_PIX_FMT_RGB8,
                    context->decoder_ctx->width, context->decoder_ctx->height);
 
     if (av_read_frame (context->fmt_ctx, &pkt) >= 0) {
@@ -244,7 +243,7 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
 }
 
 void
-de_context_prepare_encoding (DeContext *context)
+de_context_prepare_encoding (DeContext *context, const char *outfile)
 {
     AVCodec *encoder = NULL;
     printf("[LOG] Encode\n");
@@ -273,14 +272,17 @@ de_context_prepare_encoding (DeContext *context)
     context->encoder_ctx->max_b_frames = context->decoder_ctx->max_b_frames;
     context->encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
+    if (context->decoder_ctx->codec_id == AV_CODEC_ID_H264)
+        av_opt_set(context->encoder_ctx->priv_data, "preset", "slow", 0);
+
     if (avcodec_open2(context->encoder_ctx, encoder, NULL) < 0) {
         fprintf (stderr, "Could not open encoder\n");
         exit (1);
     }
 
-    context->outfile = fopen("out.mpg", "wb");
+    context->outfile = fopen(outfile, "wb");
     if (!context->outfile) {
-        fprintf (stderr, "Could not open out.mpg\n");
+        fprintf (stderr, "Could not open %s\n", outfile);
         exit (1);
     }
 
@@ -296,7 +298,7 @@ de_context_prepare_encoding (DeContext *context)
 
     context->encoder_sws_ctx = sws_getContext(context->encoded_frame->width,
                                               context->encoded_frame->height,
-                                              AV_PIX_FMT_RGB24,
+                                              AV_PIX_FMT_RGB8,
                                               context->encoded_frame->width,
                                               context->encoded_frame->height,
                                               AV_PIX_FMT_YUV420P,
@@ -320,7 +322,7 @@ de_context_set_next_frame (DeContext *context, DeFrame *frame)
     av_init_packet(&pkt);
     pkt.data = NULL;
     pkt.size = 0;
-    int linesize[1] = {3 * frame->width};
+    int linesize[1] = { frame->width };
 
     uint8_t *data[1] = { frame->frame->data[0] };
 
@@ -339,8 +341,8 @@ de_context_set_next_frame (DeContext *context, DeFrame *frame)
     }
 
     if (got_output) {
-        fwrite(pkt.data, 1, pkt.size, context->outfile);
-        av_packet_unref(&pkt);
+        fwrite (pkt.data, 1, pkt.size, context->outfile);
+        av_packet_unref (&pkt);
     }
 
     de_frame_free (frame);
@@ -353,6 +355,7 @@ de_context_end_encoding (DeContext *context)
     int got_output;
     int ret;
     int i;
+    uint8_t endcode[] = { 0, 0, 1, 0xb7 };
 
     av_init_packet(&pkt);
     pkt.data = NULL;
@@ -362,7 +365,7 @@ de_context_end_encoding (DeContext *context)
     for (got_output = 1; got_output; i++) {
         fflush(stdout);
 
-        ret = avcodec_encode_video2(context->encoder_ctx, &pkt, NULL, &got_output);
+        ret = avcodec_encode_video2 (context->encoder_ctx, &pkt, NULL, &got_output);
         if (ret < 0) {
             fprintf (stderr, "Error encoding frame\n");
             exit (1);
@@ -374,5 +377,6 @@ de_context_end_encoding (DeContext *context)
         }
     }
 
+    fwrite(endcode, 1, sizeof(endcode), context->outfile);
     fclose (context->outfile);
 }
