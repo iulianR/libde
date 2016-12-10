@@ -59,9 +59,9 @@ de_context_new (void)
 }
 
 void
-de_context_free (DeContext *context) {
-    avcodec_close (context->decoder_ctx);
-    avcodec_close (context->encoder_ctx);
+de_context_free (DeContext *context)
+{
+    avcodec_free_context (&context->encoder_ctx);
     avformat_close_input (&context->fmt_ctx);
     free (context);
 }
@@ -208,7 +208,7 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
     AVPacket pkt;
     AVFrame *rgb_frame = NULL;
     AVFrame *yuv_frame;
-    DeFrame *frame;
+    DeFrame *frame = NULL;
     int num_bytes;
     uint8_t *buffer;
 
@@ -232,9 +232,8 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
         printf("[LOG] Got packet\n");
         if (pkt.stream_index == context->stream_id) {
             frame = de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);;
-            av_packet_unref (&pkt);
 
-            return frame;
+            goto out;
         }
     } else if (!context->got_last) {
         pkt.data = NULL;
@@ -242,14 +241,17 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
         context->got_last = 1;
 
         frame = de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);
-        av_packet_unref (&pkt);
 
-        return frame;
+        goto out;
     } else {
         *got_frame = -1;
     }
 
-    return NULL;
+out:
+    av_packet_unref (&pkt);
+    av_frame_free (&yuv_frame);
+
+    return frame;
 }
 
 void
@@ -265,7 +267,7 @@ de_context_prepare_encoding (DeContext *context, const char *outfile)
         exit(1);
     }
 
-    context->encoder_ctx = avcodec_alloc_context3(encoder);
+    context->encoder_ctx = avcodec_alloc_context3 (encoder);
     if (!context->encoder_ctx) {
         fprintf (stderr, "Could not allocate video encoder context\n");
         exit (1);
