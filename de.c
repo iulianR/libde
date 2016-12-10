@@ -1,5 +1,6 @@
 #include "de.h"
 
+// #include <libavcodec/bmp.h>
 #include <libavutil/opt.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -21,24 +22,44 @@
 
 #define INBUF_SIZE 4096
 
+static DeFrame *
+de_frame_new (AVFrame *av_frame, uint8_t *data, int width, int height)
+{
+    DeFrame *frame;
+
+    av_frame->width = width;
+    av_frame->height = height;
+
+    frame = malloc (1 * sizeof(DeFrame));
+    frame->frame = av_frame;
+    frame->width = width;
+    frame->height = height;
+    frame->data = malloc (width * height * sizeof (uint8_t));
+    memcpy (frame->data, data, width * height);
+
+    return frame;
+}
+
+static void
+de_frame_free (DeFrame *frame)
+{
+    free (frame->data);
+    free (frame);
+}
+
 static DeContext *
-de_context_new (AVFormatContext *fmt_ctx,
-                int stream_id,
-                struct SwsContext *sws_ctx)
+de_context_new (void)
 {
     DeContext *context;
 
     context = malloc (1 * sizeof(DeContext));
-    context->fmt_ctx = fmt_ctx;
-    context->stream_id = stream_id;
-    context->sws_ctx = sws_ctx;
+    context->got_last = 0;
 
     return context;
 }
 
 void
 de_context_free (DeContext *context) {
-    avformat_close_input (&context->fmt_ctx);
     free (context);
 }
 
@@ -62,15 +83,15 @@ de_context_create (const char *infile)
 {
     AVFormatContext *fmt_ctx = NULL;
     int stream_id = -1;
-    AVStream *stream = NULL;
     AVCodec *decoder = NULL;
     AVDictionary *options = NULL;
     int fail = 0;
     DeContext *context;
-    struct SwsContext *sws_ctx;
 
     /* register all formats and codecs */
     av_register_all ();
+
+    context = de_context_new ();
 
     /* Open input file, and allocate format context */
     if (avformat_open_input (&fmt_ctx, infile, NULL, NULL) < 0) {
@@ -91,18 +112,18 @@ de_context_create (const char *infile)
     av_dump_format (fmt_ctx, 0, infile, 0);
 
     /* Find video stream */
-    stream_id = find_video_stream (fmt_ctx);
-    if (stream_id == -1) {
+    context->stream_id = find_video_stream (fmt_ctx);
+    if (context->stream_id == -1) {
         printf("Could not find stream\n");
         fail = 1;
         goto out;
     }
     printf("[LOG] Got video stream, id = %d\n", stream_id);
 
-    stream = fmt_ctx->streams[stream_id];
+    context->decoder_ctx = fmt_ctx->streams[context->stream_id]->codec;
 
     /* Find decoder for stream */
-    decoder = avcodec_find_decoder (stream->codec->codec_id);
+    decoder = avcodec_find_decoder (context->decoder_ctx->codec_id);
     if (!decoder) {
         fprintf(stderr, "Failed to find codec\n");
         fail = 1;
@@ -110,23 +131,23 @@ de_context_create (const char *infile)
     }
     printf("[LOG] Found codec\n");
 
-    if (avcodec_open2(stream->codec, decoder, &options) < 0) {
+    if (avcodec_open2(context->decoder_ctx, decoder, &options) < 0) {
         fprintf(stderr, "Failed to open codec\n");
         fail = 1;
         goto out;
     }
     printf("[LOG] Opened codec\n");
 
-    sws_ctx = sws_getContext(stream->codec->width,
-                             stream->codec->height,
-                             stream->codec->pix_fmt,
-                             stream->codec->width,
-                             stream->codec->height,
-                             AV_PIX_FMT_RGB24,
-                             SWS_BICUBIC,
-                             NULL,
-                             NULL,
-                             NULL);
+    context->sws_ctx = sws_getContext(context->decoder_ctx->width,
+                                      context->decoder_ctx->height,
+                                      context->decoder_ctx->pix_fmt,
+                                      context->decoder_ctx->width,
+                                      context->decoder_ctx->height,
+                                      AV_PIX_FMT_RGB24,
+                                      SWS_BICUBIC,
+                                      NULL,
+                                      NULL,
+                                      NULL);
 
 out:
     if (fail) {
@@ -134,22 +155,60 @@ out:
         return NULL;
     }
 
-    context = de_context_new (fmt_ctx, stream_id, sws_ctx);
+    context->fmt_ctx = fmt_ctx;
 
     return context;
 }
 
-AVFrame *
+static DeFrame *
+de_context_decode_frame (DeContext *context,
+                         AVFrame *yuv_frame,
+                         AVFrame *rgb_frame,
+                         AVPacket *pkt,
+                         int *got_frame)
+{
+    int ret;
+    DeFrame *frame;
+
+    ret = avcodec_decode_video2 (context->decoder_ctx,
+                                 yuv_frame,
+                                 got_frame,
+                                 pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error decoding video frame (%s)\n", av_err2str(ret));
+        return NULL;
+    }
+
+    if (*got_frame) {
+        printf("[LOG] Got frame\n");
+        /* Convert to RGB */
+        sws_scale (context->sws_ctx,
+                   (uint8_t const * const *)yuv_frame->data,
+                   yuv_frame->linesize,
+                   0,
+                   context->decoder_ctx->height,
+                   rgb_frame->data,
+                   rgb_frame->linesize);
+
+        frame = de_frame_new (rgb_frame, rgb_frame->data[0], yuv_frame->width, yuv_frame->height);
+
+        printf("[LOG] Frame converted\n");
+
+        // de_context_set_next_frame (context, frame);
+
+        return frame;
+    }
+
+    return NULL;
+}
+
+DeFrame *
 de_context_get_next_frame (DeContext *context, int *got_frame) {
     AVPacket pkt;
-    AVCodecContext *codec_ctx;
     AVFrame *rgb_frame = NULL;
     AVFrame *yuv_frame;
     int num_bytes;
-    int ret;
     uint8_t *buffer;
-
-    codec_ctx = context->fmt_ctx->streams[context->stream_id]->codec;
 
     /* Init packet and let av_read_frame fill it */
     av_init_packet(&pkt);
@@ -161,45 +220,159 @@ de_context_get_next_frame (DeContext *context, int *got_frame) {
     rgb_frame = av_frame_alloc();
 
     // Determine required buffer size and allocate buffer
-    num_bytes = avpicture_get_size(AV_PIX_FMT_RGB24, codec_ctx->width, codec_ctx->height);
-    buffer = (uint8_t *)av_malloc(num_bytes*sizeof(uint8_t));
+    num_bytes = avpicture_get_size (AV_PIX_FMT_RGB24, context->decoder_ctx->width, context->decoder_ctx->height);
+    buffer = (uint8_t *)av_malloc (num_bytes * sizeof(uint8_t));
 
     avpicture_fill((AVPicture *)rgb_frame, buffer, AV_PIX_FMT_RGB24,
-                   codec_ctx->width, codec_ctx->height);
+                   context->decoder_ctx->width, context->decoder_ctx->height);
 
     if (av_read_frame (context->fmt_ctx, &pkt) >= 0) {
         printf("[LOG] Got packet\n");
-        if (pkt.stream_index == context->stream_id) {
-            ret = avcodec_decode_video2 (codec_ctx,
-                                         yuv_frame,
-                                         got_frame,
-                                         &pkt);
-            if (ret < 0) {
-                fprintf(stderr, "Error decoding video frame (%s)\n", av_err2str(ret));
-                return NULL;
-            }
+        if (pkt.stream_index == context->stream_id)
+            return de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);;
+    } else if (!context->got_last) {
+        pkt.data = NULL;
+        pkt.size = 0;
+        context->got_last = 1;
 
-            if (*got_frame) {
-                printf("[LOG] Got frame\n");
-                /* Convert to RGB */
-                sws_scale (context->sws_ctx,
-                           (uint8_t const * const *)yuv_frame->data,
-                           yuv_frame->linesize,
-                           0,
-                           codec_ctx->height,
-                           rgb_frame->data,
-                           rgb_frame->linesize);
-
-                rgb_frame->width = yuv_frame->width;
-                rgb_frame->height = yuv_frame->height;
-
-                printf("[LOG] Frame converted\n");
-                return rgb_frame;
-            }
-        }
+        return de_context_decode_frame (context, yuv_frame, rgb_frame, &pkt, got_frame);
     } else {
         *got_frame = -1;
     }
 
     return NULL;
+}
+
+void
+de_context_prepare_encoding (DeContext *context)
+{
+    AVCodec *encoder = NULL;
+    printf("[LOG] Encode\n");
+
+    /* find the video encoder */
+    encoder = avcodec_find_encoder (context->decoder_ctx->codec_id);
+    if (!encoder) {
+        fprintf(stderr, "Codec not found\n");
+        exit(1);
+    }
+
+    context->encoder_ctx = avcodec_alloc_context3(encoder);
+    if (!context->encoder_ctx) {
+        fprintf (stderr, "Could not allocate video encoder context\n");
+        exit (1);
+    }
+
+       /* put sample parameters */
+    context->encoder_ctx->bit_rate = context->decoder_ctx->bit_rate;
+    /* resolution must be a multiple of two */
+    context->encoder_ctx->width = context->decoder_ctx->width;
+    context->encoder_ctx->height = context->decoder_ctx->height;
+    /* frames per second */
+    context->encoder_ctx->time_base = (AVRational){1, 24};
+    context->encoder_ctx->gop_size = context->decoder_ctx->gop_size;
+    context->encoder_ctx->max_b_frames = context->decoder_ctx->max_b_frames;
+    context->encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    if (avcodec_open2(context->encoder_ctx, encoder, NULL) < 0) {
+        fprintf (stderr, "Could not open encoder\n");
+        exit (1);
+    }
+
+    context->outfile = fopen("out.mpg", "wb");
+    if (!context->outfile) {
+        fprintf (stderr, "Could not open out.mpg\n");
+        exit (1);
+    }
+
+    context->encoded_frame = av_frame_alloc();
+    if (!context->encoded_frame) {
+        fprintf(stderr, "Could not allocate video outFrame\n");
+        exit(1);
+    }
+
+    context->encoded_frame->width = context->encoder_ctx->width;
+    context->encoded_frame->height = context->encoder_ctx->height;
+    context->encoded_frame->format = context->encoder_ctx->pix_fmt;
+
+    context->encoder_sws_ctx = sws_getContext(context->encoded_frame->width,
+                                              context->encoded_frame->height,
+                                              AV_PIX_FMT_RGB24,
+                                              context->encoded_frame->width,
+                                              context->encoded_frame->height,
+                                              AV_PIX_FMT_YUV420P,
+                                              SWS_BICUBIC,
+                                              0, 0, 0);
+
+    av_image_alloc(context->encoded_frame->data,
+                   context->encoded_frame->linesize,
+                   context->encoder_ctx->width,
+                   context->encoder_ctx->height,
+                   context->encoder_ctx->pix_fmt,
+                   32);
+}
+
+void
+de_context_set_next_frame (DeContext *context, DeFrame *frame)
+{
+    AVPacket pkt;
+    int got_output;
+
+    av_init_packet(&pkt);
+    pkt.data = NULL;
+    pkt.size = 0;
+    int linesize[1] = {3 * frame->width};
+
+    uint8_t *data[1] = { frame->frame->data[0] };
+
+    sws_scale(context->encoder_sws_ctx,
+              (const uint8_t * const *)data,
+              linesize,
+              0,
+              frame->height,
+              context->encoded_frame->data,
+              context->encoded_frame->linesize);
+    context->encoded_frame->pts = context->frame_count++;
+
+    if (avcodec_encode_video2(context->encoder_ctx, &pkt, context->encoded_frame, &got_output) < 0) {
+        fprintf (stderr, "Error encoding frame\n");
+        exit (1);
+    }
+
+    if (got_output) {
+        fwrite(pkt.data, 1, pkt.size, context->outfile);
+        av_packet_unref(&pkt);
+    }
+
+    de_frame_free (frame);
+}
+
+void
+de_context_end_encoding (DeContext *context)
+{
+    AVPacket pkt;
+    int got_output;
+    int ret;
+    int i;
+
+    av_init_packet(&pkt);
+    pkt.data = NULL;
+    pkt.size = 0;
+
+    /* Write delayed frames */
+    for (got_output = 1; got_output; i++) {
+        fflush(stdout);
+
+        ret = avcodec_encode_video2(context->encoder_ctx, &pkt, NULL, &got_output);
+        if (ret < 0) {
+            fprintf (stderr, "Error encoding frame\n");
+            exit (1);
+        }
+
+        if (got_output) {
+            fwrite (pkt.data, 1, pkt.size, context->outfile);
+            av_packet_unref (&pkt);
+        }
+    }
+
+    fclose (context->outfile);
 }
