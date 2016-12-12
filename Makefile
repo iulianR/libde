@@ -11,5 +11,13 @@ de.o: de.c
 libde.so: de.o
 	$(CC) $(LDFLAGS) -shared $^ -o $@
 
+fep: libde_fep.so
+
+de_fep.o: de.c
+	$(CC) $(CFLAGS) -I$(shell pwd)/../ffmpeg -fPIC -c $^ -o $@
+
+libde_fep.so: de_fep.o
+	$(CC) -L$(shell pwd)/../libraries -Wl,-rpath=$(shell pwd)/../libraries $(LDFLAGS) -shared $^ -o  $@
+
 clean:
-	rm -rf de.o libde.so
+	rm -rf de.o libde.so de_fep.o libde_fep.so
