@@ -54,6 +54,7 @@ de_context_new (void)
 
     context = malloc (1 * sizeof(DeContext));
     context->got_last = 0;
+    context->frame_count = 0;
 
     return context;
 }
@@ -183,7 +184,7 @@ de_context_decode_frame (DeContext *context,
     }
 
     if (*got_frame) {
-        printf("[LOG] Got frame\n");
+        printf("[LOG] Got frame %d\n", context->frame_count);
         /* Convert to RGB */
         sws_scale (context->sws_ctx,
                    (uint8_t const * const *)yuv_frame->data,
@@ -279,7 +280,8 @@ de_context_prepare_encoding (DeContext *context, const char *outfile)
     context->encoder_ctx->width = context->decoder_ctx->width;
     context->encoder_ctx->height = context->decoder_ctx->height;
     /* frames per second */
-    context->encoder_ctx->time_base = (AVRational){1, 24};
+    printf("FPS %d %d\n", context->decoder_ctx->time_base.num, context->decoder_ctx->time_base.den);
+    context->encoder_ctx->time_base = (AVRational)context->decoder_ctx->time_base;
     context->encoder_ctx->gop_size = context->decoder_ctx->gop_size;
     context->encoder_ctx->max_b_frames = context->decoder_ctx->max_b_frames;
     context->encoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
